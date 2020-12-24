@@ -5,21 +5,23 @@ use futures::task::{Context, Poll};
 use futures::Future;
 use std::pin::Pin;
 use tokio::time::{self, Delay, Duration};
+use pin_project::pin_project;
 
-pub type BoxFuture<O> = Pin<Box<dyn Future<Output = O>>>;
-
-pub enum RetryState<O> {
-    Running(BoxFuture<O>),
+#[pin_project(project = RetryStateProj)]
+pub enum RetryState<F> {
+    Running(#[pin] F),
     Sleeping(Delay),
 }
 
 /// Retry is a Future that returns the result of an Action
 /// It uses RetryIf to execute the Action possibly multiple times with a retry strategy
+#[pin_project]
 pub struct Retry<A>
 where
     A: Action,
 {
-    retry_if: Pin<Box<RetryIf<A>>>,
+    #[pin]
+    retry_if: RetryIf<A>,
 }
 
 impl<A> Retry<A>
@@ -34,11 +36,11 @@ where
         action: A,
     ) -> Retry<A> {
         Retry {
-            retry_if: Box::pin(RetryIf::new(
+            retry_if: RetryIf::new(
                 strategy,
                 action,
                 (|_| true) as fn(&A::Error) -> bool,
-            )),
+            ),
         }
     }
 }
@@ -49,8 +51,8 @@ where
 {
     type Output = Result<A::Item, Error<A::Error>>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.retry_if.as_mut().poll(cx)
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.project().retry_if.poll(cx)
     }
 }
 
@@ -81,8 +83,8 @@ where
         }
     }
 
-    pub fn attempt(action: &mut A) -> RetryState<Result<A::Item, A::Error>> {
-        RetryState::Running(Box::pin(action.run()))
+    pub fn attempt(action: &mut A) -> Pin<Box<RetryState<A::Future>>> {
+        Box::pin(RetryState::Running(action.run()))
     }
 
     pub async fn run<
@@ -91,14 +93,14 @@ where
         C: Condition<A::Error>,
     >(
         strategy: T,
-        mut state: RetryState<Result<A::Item, A::Error>>,
+        mut state: Pin<Box<RetryState<A::Future>>>,
         mut action: A,
         mut condition: C,
     ) -> Result<A::Item, Error<A::Error>> {
         let mut strategy = strategy.into_iter();
         loop {
-            match state {
-                RetryState::Running(ref mut f) => match f.await {
+            match state.as_mut().project() {
+                RetryStateProj::Running(ref mut f) => match f.await {
                     Ok(ok) => {
                         return Ok(ok);
                     }
@@ -110,7 +112,7 @@ where
                         }
                     }
                 },
-                RetryState::Sleeping(ref mut d) => {
+                RetryStateProj::Sleeping(ref mut d) => {
                     d.await;
                     state = Self::attempt(&mut action);
                 }
@@ -121,11 +123,11 @@ where
     pub fn retry<I: Iterator<Item = Duration>>(
         strategy: &mut I,
         err: A::Error,
-    ) -> Result<RetryState<Result<A::Item, A::Error>>, Error<A::Error>> {
+    ) -> Result<Pin<Box<RetryState<A::Future>>>, Error<A::Error>> {
         strategy
             .next()
             .ok_or_else(|| Error::OperationError(err))
-            .map(|duration| RetryState::Sleeping(time::delay_for(duration)))
+            .map(|duration| Box::pin(RetryState::Sleeping(time::delay_for(duration))))
     }
 }
 
